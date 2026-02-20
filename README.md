@@ -86,6 +86,30 @@ Re-scrape incomplete ones:
 python master.py scrape-remaining --headful
 ```
 
+### Run on EC2 with tmux
+
+Start tmux:
+
+```bash
+tmux new -s care-scrape
+```
+
+Run scraper:
+
+```bash
+uv run python master.py
+```
+
+Detach safely (leave running):
+
+- `Ctrl+b`, then `d`
+
+Reattach later:
+
+```bash
+tmux attach -t care-scrape
+```
+
 Optional flags:
 
 - `--start-url` (default: California homecare page)
