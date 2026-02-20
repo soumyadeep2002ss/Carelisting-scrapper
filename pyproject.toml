@@ -1,0 +1,9 @@
+[project]
+name = "carelisting-scrapper"
+version = "0.1.0"
+description = "ZIP-based care agency scraper for CareListing"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.54.0",
+]

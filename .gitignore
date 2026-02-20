@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Scraper outputs (generated)
+output/
+old/
+
+# Playwright/browser and runtime artifacts
+.playwright/
+playwright-report/
+
+# Logs and temp files
+*.log
+*.tmp
+*.corrupt
