@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import json
 import re
@@ -152,6 +153,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     interactive.add_argument("--only-incomplete", action="store_true")
     interactive.add_argument("--max-remaining-rounds", type=int, default=3)
     interactive.add_argument("--remaining-limit-per-round", type=int, default=0)
+    interactive.add_argument(
+        "--parallel-zips",
+        type=int,
+        default=1,
+        help="How many ZIP workflows to run in parallel (processes).",
+    )
 
     scrape_remaining = sub.add_parser(
         "scrape-remaining",
@@ -330,6 +337,22 @@ def _prompt_zip_codes() -> list[str]:
             break
 
     return _dedupe_preserve_order(zips)
+
+
+def _prompt_parallel_workers(default_value: int = 1, max_value: int = 8) -> int:
+    while True:
+        raw = input(
+            f"How many ZIPs to run in parallel? (1-{max_value}, Enter={default_value}): "
+        ).strip()
+        if raw == "":
+            return max(1, min(default_value, max_value))
+        try:
+            n = int(raw)
+            if 1 <= n <= max_value:
+                return n
+            print(f"Enter a number between 1 and {max_value}.", flush=True)
+        except ValueError:
+            print("Enter a valid integer.", flush=True)
 
 
 def _is_blank(v: Any) -> bool:
@@ -1259,88 +1282,189 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         print("No ZIP codes entered.", flush=True)
         return 1
 
+    # Ask parallelism at runtime so users don't need CLI flags.
+    max_parallel = min(8, max(1, len(zip_codes)))
+    args.parallel_zips = _prompt_parallel_workers(
+        default_value=max(1, int(args.parallel_zips)),
+        max_value=max_parallel,
+    )
+
     print(f"ZIPs: {', '.join(zip_codes)}", flush=True)
 
-    for idx, zip_code in enumerate(zip_codes, start=1):
-        # Per-ZIP output folder.
-        zip_dir = args.output_root / zip_code
-        urls_json = zip_dir / "agency_urls.json"
-        listings_json = zip_dir / "listings.json"
-        listings_csv = zip_dir / "listings.csv"
-        remaining_json = zip_dir / "remaining.json"
-
-        print(f"\n[{idx}/{len(zip_codes)}] Running workflow for ZIP {zip_code}", flush=True)
-
-        # Collect URLs for this ZIP into its own JSON.
-        rc = cmd_collect_zip_codes(
-            [zip_code],
-            start_url=args.start_url,
-            urls_json=urls_json,
-            headful=args.headful,
-            delay=args.delay,
-            max_load_more_clicks=args.max_load_more_clicks,
-            before_zip_delay=args.before_zip_delay,
-            after_zip_delay=args.after_zip_delay,
+    parallel = max(1, int(args.parallel_zips))
+    if parallel == 1 or len(zip_codes) == 1:
+        for idx, zip_code in enumerate(zip_codes, start=1):
+            rc = _run_single_zip_workflow(zip_code, args, idx=idx, total=len(zip_codes))
+            if rc != 0:
+                return rc
+    else:
+        print(
+            f"Running in parallel mode: {parallel} ZIPs at a time",
+            flush=True,
         )
-        if rc != 0:
-            return rc
-
-        # Scrape those URLs into per-ZIP listings files.
-        rc = cmd_scrape(
-            argparse.Namespace(
-                urls_json=urls_json,
-                output_json=listings_json,
-                output_csv=listings_csv,
-                remaining_json=remaining_json,
-                headful=args.headful,
-                before_scrape_delay=args.before_scrape_delay,
-                page_settle_delay=args.page_settle_delay,
-                after_scrape_delay=args.after_scrape_delay,
-                retries=args.retries,
-                retry_backoff=args.retry_backoff,
-                force=args.force,
-                only_incomplete=args.only_incomplete,
-                limit=0,
-            )
-        )
-        if rc != 0:
-            return rc
-
-        # Loop remaining for this ZIP.
-        if args.max_remaining_rounds > 0:
-            prev_remaining = _count_remaining(remaining_json)
-            for round_idx in range(1, args.max_remaining_rounds + 1):
-                if prev_remaining <= 0:
-                    break
-                print(
-                    f"ZIP {zip_code}: remaining round {round_idx}/{args.max_remaining_rounds} (items={prev_remaining})",
-                    flush=True,
-                )
-                rc = cmd_scrape_remaining(
-                    argparse.Namespace(
-                        remaining_json=remaining_json,
-                        output_json=listings_json,
-                        output_csv=listings_csv,
-                        headful=args.headful,
-                        before_scrape_delay=args.before_scrape_delay,
-                        page_settle_delay=args.page_settle_delay,
-                        after_scrape_delay=args.after_scrape_delay,
-                        retries=args.retries,
-                        retry_backoff=args.retry_backoff,
-                        limit=args.remaining_limit_per_round,
-                    )
-                )
-                if rc != 0:
-                    return rc
-                now_remaining = _count_remaining(remaining_json)
-                if now_remaining >= prev_remaining:
-                    print(f"ZIP {zip_code}: no remaining progress, stopping.", flush=True)
-                    break
-                prev_remaining = now_remaining
-
-        print(f"ZIP {zip_code} done -> {zip_dir}", flush=True)
+        worker_cfg = _to_worker_config(args)
+        try:
+            with ProcessPoolExecutor(max_workers=parallel) as pool:
+                futures = {
+                    pool.submit(_run_single_zip_workflow_worker, zip_code, worker_cfg): zip_code
+                    for zip_code in zip_codes
+                }
+                done_count = 0
+                for future in as_completed(futures):
+                    zip_code = futures[future]
+                    done_count += 1
+                    try:
+                        rc = future.result()
+                    except Exception as exc:
+                        print(f"ZIP {zip_code} failed: {type(exc).__name__}: {exc}", flush=True)
+                        return 1
+                    if rc != 0:
+                        print(f"ZIP {zip_code} failed with exit code {rc}", flush=True)
+                        return rc
+                    print(f"[{done_count}/{len(zip_codes)}] ZIP {zip_code} finished", flush=True)
+        except KeyboardInterrupt:
+            print("Interrupted. Parallel workers stopped.", flush=True)
+            return 130
 
     print("\nAll ZIPs complete.", flush=True)
+    return 0
+
+
+def _to_worker_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "output_root": str(args.output_root),
+        "start_url": str(args.start_url),
+        "headful": bool(args.headful),
+        "delay": float(args.delay),
+        "max_load_more_clicks": int(args.max_load_more_clicks),
+        "before_zip_delay": float(args.before_zip_delay),
+        "after_zip_delay": float(args.after_zip_delay),
+        "before_scrape_delay": float(args.before_scrape_delay),
+        "page_settle_delay": float(args.page_settle_delay),
+        "after_scrape_delay": float(args.after_scrape_delay),
+        "retries": int(args.retries),
+        "retry_backoff": float(args.retry_backoff),
+        "force": bool(args.force),
+        "only_incomplete": bool(args.only_incomplete),
+        "max_remaining_rounds": int(args.max_remaining_rounds),
+        "remaining_limit_per_round": int(args.remaining_limit_per_round),
+    }
+
+
+def _from_worker_config(cfg: dict[str, Any]) -> argparse.Namespace:
+    return argparse.Namespace(
+        output_root=Path(cfg["output_root"]),
+        start_url=cfg["start_url"],
+        headful=cfg["headful"],
+        delay=cfg["delay"],
+        max_load_more_clicks=cfg["max_load_more_clicks"],
+        before_zip_delay=cfg["before_zip_delay"],
+        after_zip_delay=cfg["after_zip_delay"],
+        before_scrape_delay=cfg["before_scrape_delay"],
+        page_settle_delay=cfg["page_settle_delay"],
+        after_scrape_delay=cfg["after_scrape_delay"],
+        retries=cfg["retries"],
+        retry_backoff=cfg["retry_backoff"],
+        force=cfg["force"],
+        only_incomplete=cfg["only_incomplete"],
+        max_remaining_rounds=cfg["max_remaining_rounds"],
+        remaining_limit_per_round=cfg["remaining_limit_per_round"],
+        parallel_zips=1,
+    )
+
+
+def _run_single_zip_workflow_worker(zip_code: str, cfg: dict[str, Any]) -> int:
+    args = _from_worker_config(cfg)
+    return _run_single_zip_workflow(zip_code, args, idx=0, total=0, quiet=True)
+
+
+def _run_single_zip_workflow(
+    zip_code: str,
+    args: argparse.Namespace,
+    *,
+    idx: int,
+    total: int,
+    quiet: bool = False,
+) -> int:
+    # Per-ZIP output folder.
+    zip_dir = args.output_root / zip_code
+    urls_json = zip_dir / "agency_urls.json"
+    listings_json = zip_dir / "listings.json"
+    listings_csv = zip_dir / "listings.csv"
+    remaining_json = zip_dir / "remaining.json"
+
+    if not quiet:
+        print(f"\n[{idx}/{total}] Running workflow for ZIP {zip_code}", flush=True)
+
+    # Collect URLs for this ZIP into its own JSON.
+    rc = cmd_collect_zip_codes(
+        [zip_code],
+        start_url=args.start_url,
+        urls_json=urls_json,
+        headful=args.headful,
+        delay=args.delay,
+        max_load_more_clicks=args.max_load_more_clicks,
+        before_zip_delay=args.before_zip_delay,
+        after_zip_delay=args.after_zip_delay,
+    )
+    if rc != 0:
+        return rc
+
+    # Scrape those URLs into per-ZIP listings files.
+    rc = cmd_scrape(
+        argparse.Namespace(
+            urls_json=urls_json,
+            output_json=listings_json,
+            output_csv=listings_csv,
+            remaining_json=remaining_json,
+            headful=args.headful,
+            before_scrape_delay=args.before_scrape_delay,
+            page_settle_delay=args.page_settle_delay,
+            after_scrape_delay=args.after_scrape_delay,
+            retries=args.retries,
+            retry_backoff=args.retry_backoff,
+            force=args.force,
+            only_incomplete=args.only_incomplete,
+            limit=0,
+        )
+    )
+    if rc != 0:
+        return rc
+
+    # Loop remaining for this ZIP.
+    if args.max_remaining_rounds > 0:
+        prev_remaining = _count_remaining(remaining_json)
+        for round_idx in range(1, args.max_remaining_rounds + 1):
+            if prev_remaining <= 0:
+                break
+            print(
+                f"ZIP {zip_code}: remaining round {round_idx}/{args.max_remaining_rounds} (items={prev_remaining})",
+                flush=True,
+            )
+            rc = cmd_scrape_remaining(
+                argparse.Namespace(
+                    remaining_json=remaining_json,
+                    output_json=listings_json,
+                    output_csv=listings_csv,
+                    headful=args.headful,
+                    before_scrape_delay=args.before_scrape_delay,
+                    page_settle_delay=args.page_settle_delay,
+                    after_scrape_delay=args.after_scrape_delay,
+                    retries=args.retries,
+                    retry_backoff=args.retry_backoff,
+                    limit=args.remaining_limit_per_round,
+                )
+            )
+            if rc != 0:
+                return rc
+            now_remaining = _count_remaining(remaining_json)
+            if now_remaining >= prev_remaining:
+                print(f"ZIP {zip_code}: no remaining progress, stopping.", flush=True)
+                break
+            prev_remaining = now_remaining
+
+    if not quiet:
+        print(f"ZIP {zip_code} done -> {zip_dir}", flush=True)
     return 0
 
 
@@ -1367,6 +1491,7 @@ def main(argv: list[str] | None = None) -> int:
                 only_incomplete=False,
                 max_remaining_rounds=3,
                 remaining_limit_per_round=0,
+                parallel_zips=1,
             )
         )
 
