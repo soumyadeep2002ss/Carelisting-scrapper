@@ -203,7 +203,7 @@ def read_zip_codes(path: Path) -> list[str]:
             zip_codes.append(digits[:5])
     if not zip_codes:
         raise ValueError("No valid ZIP codes found in file.")
-    return zip_codes
+    return _dedupe_preserve_order(zip_codes)
 
 
 def _normalize_zip(zip_code: str) -> str:
