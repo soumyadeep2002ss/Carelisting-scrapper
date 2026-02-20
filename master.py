@@ -402,6 +402,15 @@ def _write_json_list(path: Path, items: list[Any]) -> None:
     tmp.replace(path)
 
 
+def _format_eta(seconds: float) -> str:
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
 def write_outputs(records: list[ListingRecord], csv_path: Path, json_path: Path) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -739,6 +748,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
         context = browser.new_context()
         page = context.new_page()
         page.goto(args.start_url, wait_until="domcontentloaded", timeout=45000)
+        started_at = time.time()
+        total_zips = len(zip_codes)
 
         for idx, zip_code in enumerate(zip_codes, start=1):
             if args.before_zip_delay > 0:
@@ -786,6 +797,14 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 # Persist even if the ZIP failed mid-way (best-effort).
                 _write_json_list(args.urls_json, collected)
                 page.goto(args.start_url, wait_until="domcontentloaded", timeout=45000)
+                elapsed = time.time() - started_at
+                left = max(0, total_zips - idx)
+                avg_per_zip = elapsed / idx if idx else 0
+                eta = avg_per_zip * left
+                print(
+                    f"  progress: {idx}/{total_zips} | left={left} | eta={_format_eta(eta)}",
+                    flush=True,
+                )
                 if args.after_zip_delay > 0:
                     time.sleep(args.after_zip_delay)
 
@@ -862,30 +881,42 @@ def cmd_scrape(args: argparse.Namespace) -> int:
     skipped_complete = 0
     skipped_existing = 0
 
+    targets: list[tuple[str, str]] = []
+    for it in url_items:
+        url = str(it.get("listing_url") or "").strip()
+        zip_code = str(it.get("zip_code") or "").strip()
+        if not url or not is_agency_profile_url(url):
+            continue
+        existing_rec = all_by_url.get(url)
+        if existing_rec is not None and args.only_incomplete and _is_complete_record(existing_rec):
+            skipped_complete += 1
+            continue
+        if existing_rec is not None and not args.force and not args.only_incomplete:
+            skipped_existing += 1
+            continue
+        targets.append((url, zip_code))
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headful)
         context = browser.new_context()
         detail_page = context.new_page()
+        started_at = time.time()
+        total = len(targets)
 
-        total = len(url_items)
-        for idx, it in enumerate(url_items, start=1):
-            url = str(it.get("listing_url") or "").strip()
-            zip_code = str(it.get("zip_code") or "").strip()
-            if not url or not is_agency_profile_url(url):
-                continue
-
+        for idx, (url, zip_code) in enumerate(targets, start=1):
             existing_rec = all_by_url.get(url)
-            if existing_rec is not None and args.only_incomplete and _is_complete_record(existing_rec):
-                skipped_complete += 1
-                continue
-            if existing_rec is not None and not args.force and not args.only_incomplete:
-                skipped_existing += 1
-                continue
 
             if args.before_scrape_delay > 0:
                 time.sleep(args.before_scrape_delay)
 
-            print(f"[{idx}/{total}] scraping {url}", flush=True)
+            left = max(0, total - idx)
+            elapsed = time.time() - started_at
+            avg = elapsed / idx if idx else 0
+            eta = avg * left
+            print(
+                f"[{idx}/{total}] scraping {url} | left={left} | eta={_format_eta(eta)}",
+                flush=True,
+            )
             processed += 1
 
             record: ListingRecord | None = None
@@ -905,7 +936,7 @@ def cmd_scrape(args: argparse.Namespace) -> int:
                     print("Interrupted. Saved progress so far.", flush=True)
                     browser.close()
                     return 130
-                except TimeoutError as exc:
+                except TimeoutError:
                     if attempt < args.retries:
                         time.sleep(args.retry_backoff * attempt)
                         continue
@@ -990,6 +1021,8 @@ def cmd_scrape_remaining(args: argparse.Namespace) -> int:
         browser = p.chromium.launch(headless=not args.headful)
         context = browser.new_context()
         detail_page = context.new_page()
+        started_at = time.time()
+        total = len(remaining_items)
 
         for idx, item in enumerate(remaining_items, start=1):
             url = str(item.get("listing_url") or "").strip()
@@ -999,6 +1032,14 @@ def cmd_scrape_remaining(args: argparse.Namespace) -> int:
 
             if args.before_scrape_delay > 0:
                 time.sleep(args.before_scrape_delay)
+            left = max(0, total - idx)
+            elapsed = time.time() - started_at
+            avg = elapsed / idx if idx else 0
+            eta = avg * left
+            print(
+                f"[{idx}/{total}] retrying {url} | left={left} | eta={_format_eta(eta)}",
+                flush=True,
+            )
 
             merged = dict(item)
             success = False
