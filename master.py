@@ -4,9 +4,11 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import json
+import logging
 import re
 import sys
 import time
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,8 +23,77 @@ PHONE_PATTERN = re.compile(
 )
 PROFILE_ID_PATH_RE = re.compile(r"/[0-9a-f]{24}/?$", re.IGNORECASE)
 
+LOG_PATH = Path("output/logs/scraper.log")
+
+
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("carelisting")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception:
+        # If file handler fails (e.g., permissions), keep console logging.
+        pass
+
+    return logger
+
+
+LOGGER = _setup_logger()
+
 
 FIELDS = ["zip_code", "listing_url", "name", "address", "phone", "agency_type", "about"]
+
+
+def wait_for_page_ready(page: Page, timeout_ms: int = 45000) -> None:
+    """Best-effort wait to ensure the page is fully loaded."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        LOGGER.debug("wait_for_load_state domcontentloaded timed out")
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        LOGGER.debug("wait_for_load_state networkidle timed out")
+
+
+def _load_zip_status(status_path: Path, zip_codes: list[str]) -> dict[str, set[str]]:
+    """Load or initialize tracking for ZIP progress so reruns can pick up missed ZIPs."""
+    processed: set[str] = set()
+    failed: set[str] = set()
+    pending: set[str] = set(zip_codes)
+    try:
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+        processed = set(data.get("processed", []))
+        failed = set(data.get("failed", []))
+        pending = set(data.get("pending", [])) or (set(zip_codes) - processed - failed)
+    except Exception:
+        pass
+    # Ensure only ZIPs from the current run remain.
+    processed &= set(zip_codes)
+    failed &= set(zip_codes)
+    pending = (set(zip_codes) - processed - failed) | (pending & set(zip_codes))
+    return {"processed": processed, "failed": failed, "pending": pending}
+
+
+def _save_zip_status(status_path: Path, status: dict[str, set[str]]) -> None:
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "processed": sorted(status["processed"]),
+        "failed": sorted(status["failed"]),
+        "pending": sorted(status["pending"]),
+    }
+    status_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 @dataclass
@@ -688,7 +759,8 @@ def scrape_listing_reuse_page(
     zip_code: str,
     page_settle_delay: float,
 ) -> ListingRecord:
-    page.goto(listing_url, wait_until="domcontentloaded", timeout=45000)
+    page.goto(listing_url, wait_until="load", timeout=45000)
+    wait_for_page_ready(page)
     # Ensure the main profile UI is present; if not, treat as a soft failure.
     try:
         page.wait_for_selector(".profile-header-modern, h1", timeout=15000)
@@ -766,11 +838,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
         out.append({"zip_code": str(it.get("zip_code") or ""), "listing_url": url})
     collected = out
 
+    zip_status_path = args.urls_json.parent / "zip_status.json"
+    zip_status = _load_zip_status(zip_status_path, zip_codes)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headful)
         context = browser.new_context()
         page = context.new_page()
-        page.goto(args.start_url, wait_until="domcontentloaded", timeout=45000)
+        page.goto(args.start_url, wait_until="load", timeout=45000)
+        wait_for_page_ready(page)
         started_at = time.time()
         total_zips = len(zip_codes)
 
@@ -779,6 +855,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 time.sleep(args.before_zip_delay)
 
             print(f"[{idx}/{len(zip_codes)}] collecting URLs for ZIP {zip_code}...", flush=True)
+            success = False
             try:
                 fill_zip_and_search(page, zip_code)
                 result_count = get_results_count_from_heading(page)
@@ -807,6 +884,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
                     f"(load-more clicks: {click_count})",
                     flush=True,
                 )
+                success = True
             except KeyboardInterrupt:
                 # Always keep what we already collected.
                 _write_json_list(args.urls_json, collected)
@@ -814,12 +892,22 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 break
             except TimeoutError:
                 print("  timeout collecting URLs, skipping ZIP", flush=True)
+                LOGGER.warning("collect timeout zip=%s url=%s", zip_code, args.start_url)
             except Exception as exc:
                 print(f"  failed collecting URLs: {exc}", flush=True)
+                LOGGER.exception("collect failed zip=%s url=%s error=%s", zip_code, args.start_url, exc)
             finally:
                 # Persist even if the ZIP failed mid-way (best-effort).
                 _write_json_list(args.urls_json, collected)
-                page.goto(args.start_url, wait_until="domcontentloaded", timeout=45000)
+                page.goto(args.start_url, wait_until="load", timeout=45000)
+                wait_for_page_ready(page)
+                # Update ZIP status for reruns.
+                zip_status["pending"].discard(zip_code)
+                if success:
+                    zip_status["processed"].add(zip_code)
+                else:
+                    zip_status["failed"].add(zip_code)
+                _save_zip_status(zip_status_path, zip_status)
                 elapsed = time.time() - started_at
                 left = max(0, total_zips - idx)
                 avg_per_zip = elapsed / idx if idx else 0
@@ -964,12 +1052,14 @@ def cmd_scrape(args: argparse.Namespace) -> int:
                         time.sleep(args.retry_backoff * attempt)
                         continue
                     print(f"  timeout: {url}", flush=True)
+                    LOGGER.warning("scrape timeout url=%s zip=%s attempt=%s", url, zip_code, attempt)
                     record = None
                 except Exception as exc:
                     if attempt < args.retries:
                         time.sleep(args.retry_backoff * attempt)
                         continue
                     print(f"  error: {type(exc).__name__}: {exc}", flush=True)
+                    LOGGER.exception("scrape error url=%s zip=%s attempt=%s error=%s", url, zip_code, attempt, exc)
                     record = None
 
             if record is None:
@@ -1107,12 +1197,14 @@ def cmd_scrape_remaining(args: argparse.Namespace) -> int:
                         time.sleep(args.retry_backoff * attempt)
                         continue
                     print(f"  timeout: {url}", flush=True)
+                    LOGGER.warning("scrape-remaining timeout url=%s zip=%s attempt=%s", url, zip_code, attempt)
                     break
                 except Exception as exc:
                     if attempt < args.retries:
                         time.sleep(args.retry_backoff * attempt)
                         continue
                     print(f"  error: {type(exc).__name__}: {exc}", flush=True)
+                    LOGGER.exception("scrape-remaining error url=%s zip=%s attempt=%s error=%s", url, zip_code, attempt, exc)
                     break
 
             if success and _is_complete_dict(merged):
@@ -1469,11 +1561,14 @@ def _run_single_zip_workflow(
 
 
 def main(argv: list[str] | None = None) -> int:
+    start_ts = datetime.now()
+    start_seconds = time.time()
+
     # If user runs "python master.py" with no args, default to interactive prompts.
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
-        return cmd_interactive(
+        rc = cmd_interactive(
             argparse.Namespace(
                 output_root=Path("output"),
                 start_url=DEFAULT_START_URL,
@@ -1494,23 +1589,35 @@ def main(argv: list[str] | None = None) -> int:
                 parallel_zips=1,
             )
         )
+    else:
+        args = parse_args(argv)
+        if args.command == "collect":
+            rc = cmd_collect(args)
+        elif args.command == "scrape":
+            rc = cmd_scrape(args)
+        elif args.command == "run-all":
+            rc = cmd_run_all(args)
+        elif args.command == "workflow":
+            rc = cmd_workflow(args)
+        elif args.command == "interactive":
+            rc = cmd_interactive(args)
+        elif args.command == "build-remaining":
+            rc = cmd_build_remaining(args)
+        elif args.command == "scrape-remaining":
+            rc = cmd_scrape_remaining(args)
+        else:
+            rc = 1
 
-    args = parse_args(argv)
-    if args.command == "collect":
-        return cmd_collect(args)
-    if args.command == "scrape":
-        return cmd_scrape(args)
-    if args.command == "run-all":
-        return cmd_run_all(args)
-    if args.command == "workflow":
-        return cmd_workflow(args)
-    if args.command == "interactive":
-        return cmd_interactive(args)
-    if args.command == "build-remaining":
-        return cmd_build_remaining(args)
-    if args.command == "scrape-remaining":
-        return cmd_scrape_remaining(args)
-    raise RuntimeError(f"Unknown command: {args.command}")
+    end_ts = datetime.now()
+    duration_seconds = int(time.time() - start_seconds)
+    msg = (
+        f"Start: {start_ts.isoformat(timespec='seconds')} | "
+        f"End: {end_ts.isoformat(timespec='seconds')} | "
+        f"Duration: {_format_eta(duration_seconds)}"
+    )
+    print(msg, flush=True)
+    LOGGER.info(msg)
+    return rc
 
 
 if __name__ == "__main__":

@@ -123,8 +123,11 @@ By default it writes:
 
 - `output/listings.csv`
 - `output/listings.json`
+- `output/logs/scraper.log` (timestamps, timeouts/errors, start/end/duration)
+- `output/zip_status.json` tracks collect progress (`processed`, `failed`, `pending` ZIPs)
 
 ### Notes
 
 - Selectors are resilient but website changes can still require updates.
 - This scraper de-duplicates listing URLs across ZIP searches.
+- Rerun failed/pending ZIPs: open `output/zip_status.json`, copy the `failed` or `pending` ZIPs to a file, then rerun collect pointing to that file (e.g., `python master.py collect --zip-file failed_zips.txt --urls-json output/agency_urls.json --headful`).
