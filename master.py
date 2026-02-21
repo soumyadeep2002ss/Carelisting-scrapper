@@ -536,13 +536,31 @@ def fill_zip_and_search(page: Page, zip_code: str, timeout_ms: int = 20000) -> N
     input_selectors = [
         "input[placeholder*='Zip' i]",
         "input[placeholder*='ZIP' i]",
+        "input[placeholder*='zipcode' i]",
+        "input[placeholder*='Enter ZIP' i]",
+        "input[aria-label*='zip' i]",
         "input[name*='zip' i]",
+        "input[name='zipcode']",
+        "input[name='zipCode']",
         "input[id*='zip' i]",
+        "input[data-testid*='zip' i]",
+        "[role='searchbox']",
+        "[role='combobox'][aria-label*='zip' i]",
         "input[type='search']",
         "input[type='text']",
     ]
+    try:
+        page.wait_for_selector(", ".join(input_selectors), timeout=timeout_ms)
+    except Exception:
+        # Proceed to scan manually; this may happen if the page layout changed.
+        LOGGER.warning("zip input wait_for_selector timed out, scanning manually")
+
     zip_input = first_visible(page, input_selectors)
     if zip_input is None:
+        # Detect common block pages (e.g., Cloudflare).
+        block_markers = page.locator("text=cloudflare, text=Attention Required, text=Please enable JavaScript").count()
+        if block_markers > 0:
+            raise RuntimeError("Blocked or challenge page detected (e.g., Cloudflare).")
         raise RuntimeError("Could not find ZIP search input.")
 
     zip_input.click()
