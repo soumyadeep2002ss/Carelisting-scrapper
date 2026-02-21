@@ -908,6 +908,13 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 else:
                     zip_status["failed"].add(zip_code)
                 _save_zip_status(zip_status_path, zip_status)
+                proc_count = len(zip_status["processed"])
+                fail_count = len(zip_status["failed"])
+                pend_count = len(zip_status["pending"])
+                print(
+                    f"  zip status -> processed={proc_count} failed={fail_count} pending={pend_count}",
+                    flush=True,
+                )
                 elapsed = time.time() - started_at
                 left = max(0, total_zips - idx)
                 avg_per_zip = elapsed / idx if idx else 0
